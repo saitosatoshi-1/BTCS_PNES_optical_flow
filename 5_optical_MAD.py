@@ -1,8 +1,5 @@
 # =============================================================
 # Body-axis Optical Flow in Fixed ROI (manual polygon)
-# QC breakdown付き
-#
-# このセルでやること（初心者向けまとめ）
 # -------------------------------------------------------------
 # 1) 動画を1フレームずつ読む
 # 2) 前フレームと今フレームから Optical Flow（動き）を計算する
@@ -35,7 +32,6 @@ DRAW_SPIKE  = True    # スパイク時にROI枠の色を変える
 WIN_SEC_MAD = 10.0    # スパイク判定に使う履歴の長さ（秒）
 
 # Farnebäck法の設定（Optical Flowの計算方法のパラメータ）
-# 初心者は基本いじらなくてOK
 FB_PARAMS = dict(
     pyr_scale=0.5,
     levels=3,
