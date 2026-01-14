@@ -11,9 +11,6 @@ video-EEG monitoring (VEEG) recordings and corresponds to the analyses reported 
 > *Quantitative Analysis of Upper Limb Clonic Movements in Tonic–Clonic Seizures and  
 > Psychogenic Nonepileptic Seizures Using Optical Flow*
 
-This repository focuses on **interpretability and clinical relevance**, rather than
-black-box classification.
-
 ---
 
 ## Key Concepts
