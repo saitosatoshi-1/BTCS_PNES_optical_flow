@@ -1,9 +1,10 @@
-### Interactive BED polygon editor (Jupyter)
+""" Interactive BED polygon editor (Jupyter)
 This cell helps you define a 4-point polygon (bed/ROI gate) on a representative video frame.
 You can adjust each vertex and apply a global rotation, then copy the printed coordinates
 into a JSON configuration file (e.g., `gate_config.json`).
 
 Note: This UI uses `ipywidgets`, so it works best in Jupyter/Colab.
+"""
 
 import numpy as np
 import cv2
