@@ -1,92 +1,79 @@
 # ==========================================================
-# Person1 Tracking + Pose Estimation + RAW NPZ Export
+# Person1 Tracking + Pose Estimation
 #
-# このセルでやっていること（超ざっくり）:
-# 1) 動画を1フレームずつ読む
-# 2) YOLO Pose で「人」と「骨格(17点)」を検出する
-# 3) ベッドの中にいる人だけを候補にする
-# 4) 候補の中から「患者っぽい人」を1人選ぶ（person1）
-# 5) person1 の骨格を毎フレーム保存する（欠けた所は NaN）
-# 6) 確認用に骨格を描いた動画も保存する
+# What this cell does.
+#  1. Read a video frame-by-frame.
+#  2. Run YOLO Pose to detect persons and 17 keypoints (COCO format).
+#  3. Keep only detections whose "person center" falls inside a bed polygon gate.
+#  4. If exactly one candidate is inside the gate, lock it as "person1".
+#  5. Save keypoints over time to an NPZ file.
+#  6. Draw the skeleton on an output video.
+#  7. If detection fails, do not crash. Fill with NaN or carry forward the last valid result.
 #
-# なぜ NPZ で保存する?
-# ・後から解析（PCA, ADS, 周期解析など）をするときに,
-#   まず「生の骨格データ」が必要だから
-# ・NPZ は numpy配列をそのまま保存できて速くて便利
+# Typical use case.
+#  - Create stable tracking of the bed patient (person1) in VEEG videos.
+#  - Use the saved keypoints for downstream motion analysis.
+#
+# Privacy note.
+#  - This cell optionally applies face mosaic using facial keypoints (nose, eyes, ears).
 # ==========================================================
 
+
+# ----------------------------------------------------------
+# 1. Imports
+# ----------------------------------------------------------
 import os
 import numpy as np
 import cv2
 from ultralytics import YOLO
 
+
 # ----------------------------------------------------------
-# 0) ファイルパス（入力と出力）
+# 2. Paths and constants
 # ----------------------------------------------------------
-# 入力動画（切り出し済みの mp4 を想定）
 video_path   = "/content/FBTCS_qt.mp4"
-
-# 追跡の様子を描いた動画（確認用）
 out_try_path = "/content/track.mp4"
-
-# macOSのQuickTimeで確実に再生できる形式にした動画
 out_qt_path  = "/content/track_qt.mp4"
-
-# （今回はほぼ使っていない）ログファイル
-log_path     = "/content/events.log"
-
-# 骨格の「生データ」を保存する NPZ
 npz_out      = "/content/track.npz"
 
-# ----------------------------------------------------------
-# 1) ベッド領域（BED polygon）の読み込み
-# ----------------------------------------------------------
-# 注意:
-#   poly_rot_global は「前のセル（UI調整）」で作った変数
-#   つまり, このセル単体では動かず,
-#   先にベッド領域をスライダーで決めている必要がある
-print(poly_rot_global)
-assert poly_rot_global is not None, "BED polygon not set"
+# Minimum confidence threshold for YOLO keypoints.
+# Keypoints below this will be treated as missing (NaN).
+CONF_MIN = 0.3
 
-# OpenCV の pointPolygonTest が使える形に整形する
-# (N,2) -> (N,1,2) という形にする
-priority_coords = poly_rot_global.astype(np.float32)
-gate_poly = priority_coords.reshape(-1, 1, 2).astype(np.float32)
+# Face mosaic settings (tune if needed).
+FACE_MOSAIC_BLOCK = 14   # larger = coarser mosaic
+FACE_CONF_THR = 0.3      # confidence threshold for facial keypoints
 
-# ベッド中心座標（候補から「ベッド中心に近い人」を選ぶため）
-bed_cx = float(priority_coords[:, 0].mean())
-bed_cy = float(priority_coords[:, 1].mean())
+# COCO 17-keypoint skeleton connections (which joints to connect by lines).
+SKELETON = [
+    (0, 1), (1, 3), (0, 2), (2, 4),
+    (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 6), (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16)
+]
 
-# ベッドの外接矩形（これは「見た目用」, 解析にはほぼ使わない）
-bx1, by1 = priority_coords.min(axis=0)
-bx2, by2 = priority_coords.max(axis=0)
 
 # ----------------------------------------------------------
-# 2) YOLO Pose モデルを読み込む
-# ----------------------------------------------------------
-# YOLO Pose は「人」を検出して, 17点の骨格座標を返す
-# yolo11x は重いが検出が安定しやすい
-pose_model = YOLO("yolo11x-pose.pt")
-
-# ----------------------------------------------------------
-# 3) 便利な関数たち（難しく見えるが, やってることは単純）
+# 3. Utility functions (small building blocks)
+#    These are called by other functions, so we define them first.
 # ----------------------------------------------------------
 def center_from_kpts(kp_xy):
     """
-    人物の「中心」を推定する関数
+    Compute a representative person center from keypoints.
 
-    kp_xy は (17,2) で, 17個の点それぞれが (x,y)
-    ただし検出できない点は NaN になっていることがある.
+    Parameters
+    ----------
+    kp_xy : ndarray, shape (17, 2)
+        Keypoint coordinates (x, y).
+        Low-confidence keypoints are expected to be NaN already.
 
-    やること:
-    ・NaN じゃない点だけ使って平均を取り,
-      だいたいの人物中心 (x,y) を作る
-
-    返り値:
-    ・中心 (x,y) の numpy配列
-    ・全部 NaN なら None
+    Returns
+    -------
+    center : ndarray, shape (2,) or None
+        Mean (x, y) of all valid (non-NaN) keypoints.
+        Returns None if no valid keypoints are available.
     """
-    valid = ~np.isnan(kp_xy).any(axis=1)  # xかyがNaNなら無効
+    valid = ~np.isnan(kp_xy).any(axis=1)
     if not np.any(valid):
         return None
     return np.nanmean(kp_xy[valid], axis=0)
@@ -94,12 +81,10 @@ def center_from_kpts(kp_xy):
 
 def inside_gate(x, y):
     """
-    点(x,y)がベッド領域（gate_poly）の内側かどうかを調べる
+    Check whether a point (x, y) lies inside the bed polygon gate.
 
-    True:
-      ベッドの中（患者の可能性が高い）
-    False:
-      ベッドの外（介助者の可能性が高い）
+    This uses OpenCV pointPolygonTest.
+    gate_poly must be a global polygon with shape (N, 1, 2).
     """
     return cv2.pointPolygonTest(
         gate_poly,
@@ -110,52 +95,41 @@ def inside_gate(x, y):
 
 def compute_head_point(kp_xy, kp_c, conf_thr=0.3):
     """
-    頭部の代表点 (x,y) を決める関数
+    Determine a single representative head point.
 
-    目的:
-    ・後段解析で「頭の位置」を使うことがあるため
+    Strategy
+    ----------
+    1. If nose (index 0) is valid, use it.
+    2. Otherwise, use the mean of valid facial points: eyes and ears (indices 1-4).
+    3. If nothing is valid, return NaN.
 
-    優先順位:
-    1) nose（鼻）が取れていれば鼻
-    2) 鼻が無理なら, 目や耳（複数点）の平均
-
-    kp_xy: (17,2) 座標
-    kp_c : (17,) 各点の信頼度
+    Returns
+    -------
+    head_xy : ndarray, shape (2,)
+        Head point (x, y) or [NaN, NaN].
+    head_src : str
+        "nose", "face", or "none".
     """
-    # 0番は nose
     if kp_c[0] >= conf_thr and np.isfinite(kp_xy[0]).all():
         return kp_xy[0].copy(), "nose"
 
-    # 目と耳の index（COCO形式）
-    face_idx = [1, 2, 3, 4]
-
+    face_idx = [1, 2, 3, 4]  # eyes, ears
     valid = [
         i for i in face_idx
         if kp_c[i] >= conf_thr and np.isfinite(kp_xy[i]).all()
     ]
-
     if len(valid) > 0:
         return np.mean(kp_xy[valid], axis=0), "face"
 
     return np.array([np.nan, np.nan]), "none"
 
 
-# 骨格の線を引くための「接続ルール」（見た目用）
-SKELETON = [
-    (0,1),(1,3),(0,2),(2,4),
-    (5,7),(7,9),(6,8),(8,10),
-    (5,6),(5,11),(6,12),(11,12),
-    (11,13),(13,15),(12,14),(14,16)
-]
-
-
-def draw_skeleton(img, kp_xy, color=(0,0,255), th=2):
+def draw_skeleton(img, kp_xy, color=(0, 0, 255), th=2):
     """
-    画像に骨格の線を描く（確認用）
+    Draw the skeleton on a frame for visual QC.
 
-    注意:
-    ・解析のためではなく,
-      「追跡が合ってるか」見るために描いている
+    img is an OpenCV image (BGR).
+    kp_xy is (17,2) with NaN for missing points.
     """
     for a, b in SKELETON:
         xa, ya = kp_xy[a]
@@ -170,23 +144,223 @@ def draw_skeleton(img, kp_xy, color=(0,0,255), th=2):
                 th
             )
 
+
+def clip_box(x1, y1, x2, y2, W, H):
+    """
+    Clip a bounding box so it stays inside the image.
+    """
+    x1 = int(max(0, min(W - 2, x1)))
+    y1 = int(max(0, min(H - 2, y1)))
+    x2 = int(max(x1 + 1, min(W, x2)))
+    y2 = int(max(y1 + 1, min(H, y2)))
+    return x1, y1, x2, y2
+
+
+def apply_mosaic(img, x1, y1, x2, y2, block=14):
+    """
+    Apply pixelation mosaic to a rectangle region.
+    Larger block means coarser mosaic.
+    """
+    roi = img[y1:y2, x1:x2]
+    h, w = roi.shape[:2]
+    if h <= 2 or w <= 2:
+        return img
+
+    small_w = max(1, w // block)
+    small_h = max(1, h // block)
+
+    roi_small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+    roi_mos   = cv2.resize(roi_small, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    out = img.copy()
+    out[y1:y2, x1:x2] = roi_mos
+    return out
+
+
+def face_bbox_from_kpts(kp_xy, kp_c, W, H, conf_thr=0.3, margin_x=0.6, margin_y=0.9):
+    """
+    Estimate a face bounding box from facial keypoints (nose, eyes, ears).
+
+    Returns
+    -------
+    bbox : tuple (x1, y1, x2, y2) or None
+        Returns None if too few facial points are available.
+    """
+    face_idx = [0, 1, 2, 3, 4]  # nose, eyes, ears
+    pts = []
+    for i in face_idx:
+        x, y = kp_xy[i]
+        c = kp_c[i]
+        if (c >= conf_thr) and np.isfinite(x) and np.isfinite(y):
+            pts.append([x, y])
+
+    # If points are insufficient, the bbox becomes unstable.
+    if len(pts) < 2:
+        return None
+
+    pts = np.asarray(pts, float)
+    x_min, y_min = pts[:, 0].min(), pts[:, 1].min()
+    x_max, y_max = pts[:, 0].max(), pts[:, 1].max()
+
+    bw = max(2.0, x_max - x_min)
+    bh = max(2.0, y_max - y_min)
+
+    x1 = x_min - margin_x * bw
+    x2 = x_max + margin_x * bw
+    y1 = y_min - margin_y * bh
+    y2 = y_max + margin_y * bh
+
+    return clip_box(x1, y1, x2, y2, W, H)
+
+
 # ----------------------------------------------------------
-# 4) 動画を開く + 出力動画の準備
+# 4. Per-frame functions (medium-level logic built from utilities)
+# ----------------------------------------------------------
+def yolo_pose(frame):
+    """
+    Run YOLO Pose on a single frame.
+
+    Returns
+    -------
+    boxes : ndarray, shape (N,4)
+        Bounding boxes for detected persons, each row is (x1, y1, x2, y2).
+    kpts_all : ndarray, shape (N,17,3)
+        Keypoints for each person, each keypoint is (x, y, confidence).
+    """
+    res = pose_model.predict(
+        frame,
+        verbose=False,
+        conf=CONF_MIN
+    )[0]
+
+    boxes = (
+        res.boxes.xyxy.cpu().numpy()
+        if res.boxes is not None else np.zeros((0, 4))
+    )
+
+    kpts_all = (
+        res.keypoints.data.cpu().numpy()
+        if res.keypoints is not None else np.zeros((0, 17, 3))
+    )
+
+    return boxes, kpts_all
+
+
+def make_candidates(boxes, kpts_all):
+    """
+    Collect persons whose representative center lies inside the bed polygon gate.
+
+    We first compute a "person center" from keypoints (mean of valid points).
+    If keypoints are all missing, fall back to bbox center.
+
+    Returns
+    -------
+    candidates : list of dict
+        Each dict contains:
+        - i      : person index in YOLO output
+        - center : ndarray (2,)
+        - kp_xy  : ndarray (17,2) with NaN for low-confidence points
+        - kp_c   : ndarray (17,)
+    """
+    candidates = []
+
+    for i in range(kpts_all.shape[0]):
+        kp_xy = kpts_all[i, :, :2].copy()
+        kp_c  = kpts_all[i, :, 2].copy()
+
+        # Treat low-confidence points as missing.
+        kp_xy[kp_c < CONF_MIN] = np.nan
+
+        center = center_from_kpts(kp_xy)
+
+        # If skeleton center is undefined, use bbox center.
+        if center is None:
+            if boxes.shape[0] > i:
+                x1, y1, x2, y2 = boxes[i]
+                center = np.array([(x1 + x2) / 2, (y1 + y2) / 2])
+            else:
+                continue
+
+        if inside_gate(center[0], center[1]):
+            candidates.append(
+                dict(i=i, center=center, kp_xy=kp_xy, kp_c=kp_c)
+            )
+
+    return candidates
+
+
+def pack_result(chosen):
+    """
+    Convert the chosen person dict into arrays suitable for saving.
+
+    Returns
+    -------
+    row_k : ndarray, shape (17,3)
+        [x, y, confidence] for each keypoint.
+    head_xy : ndarray, shape (2,)
+        Representative head point (x, y).
+    head_src : str
+        "nose", "face", or "none".
+    """
+    row_k = np.stack(
+        [chosen["kp_xy"][:, 0], chosen["kp_xy"][:, 1], chosen["kp_c"]],
+        axis=1
+    )
+
+    head_xy, head_src = compute_head_point(
+        chosen["kp_xy"], chosen["kp_c"], CONF_MIN
+    )
+
+    return row_k, head_xy, head_src
+
+
+def missing_result(last_valid_row_k, last_valid_head_xy, last_valid_head_src, carry=True):
+    """
+    Fill a frame where person1 cannot be uniquely determined.
+
+    carry=True:
+      Use the last locked result if available. This is useful for continuity.
+    carry=False:
+      Always return NaN.
+
+    Returns
+    -------
+    row_k : (17,3)
+    head_xy : (2,)
+    head_src : str
+    state_str : str, one of "CARRY" or "MISSING"
+    """
+    if carry and (last_valid_row_k is not None):
+        row_k = last_valid_row_k.copy()
+
+        if last_valid_head_xy is not None:
+            head_xy = last_valid_head_xy.copy()
+            head_src = last_valid_head_src if last_valid_head_src is not None else "carried"
+        else:
+            head_xy = np.array([np.nan, np.nan], dtype=float)
+            head_src = "carried_nohead"
+
+        return row_k, head_xy, head_src, "CARRY"
+
+    row_k = np.full((17, 3), np.nan, dtype=float)
+    head_xy = np.array([np.nan, np.nan], dtype=float)
+    return row_k, head_xy, "missing", "MISSING"
+
+
+# ----------------------------------------------------------
+# 5. Initialization (video, model, polygon gate)
 # ----------------------------------------------------------
 cap = cv2.VideoCapture(video_path)
 if not cap.isOpened():
     raise RuntimeError(f"VideoCapture failed: {video_path}")
 
-# fps が取れない動画もあるので, その場合は 30fps とする
 fps = cap.get(cv2.CAP_PROP_FPS)
-if not fps or fps <= 0:
+if fps is None or fps <= 0:
     fps = 30.0
 
-# 動画サイズ
 W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-# 骨格を描いた動画を書き出すための writer
 out = cv2.VideoWriter(
     out_try_path,
     cv2.VideoWriter_fourcc(*"mp4v"),
@@ -194,199 +368,124 @@ out = cv2.VideoWriter(
     (W, H)
 )
 
-# ----------------------------------------------------------
-# 5) 状態（state）の考え方
-# ----------------------------------------------------------
-# state は「今どういう状況か」を文字で持つ
-#
-# INIT:
-#   まだ person1（患者役）が決まっていない
-#
-# LOCKED:
-#   person1 が決まっていて追跡中
-#
-# MISSING:
-#   そのフレームでベッド内に人が検出できない
-#
-# ※今のコードはシンプルに
-#   毎フレーム「ベッド中心に近い人」を選ぶ設計になっている
-state = "INIT"
+# YOLO Pose model (choose size based on your compute budget).
+pose_model = YOLO("yolo11x-pose.pt")
 
-person1_idx = None
-prev_center = None
+# Bed polygon gate.
+# This code expects poly_rot_global to be defined upstream,
+# for example from an interactive polygon editor cell.
+assert poly_rot_global is not None, "BED polygon not set. Please run the polygon editor cell first."
+
+priority_coords = poly_rot_global.astype(np.float32)
+gate_poly = priority_coords.reshape(-1, 1, 2)
+
+polygon_cx = float(priority_coords[:, 0].mean())
+polygon_cy = float(priority_coords[:, 1].mean())
+
 
 # ----------------------------------------------------------
-# 6) フレームごとに保存したいデータの入れ物（リスト）
+# 6. Main loop (frame-by-frame processing)
 # ----------------------------------------------------------
-# 後で np.array に変換して NPZ に入れる
-all_kpts        = []   # 1フレームにつき (17,3) を保存（x,y,conf）
-all_state       = []   # INIT / LOCKED / MISSING
-all_idx         = []   # 選ばれた person の index（検出結果の何番目か）
-all_head_xy     = []   # 頭代表点 (x,y)
-all_head_source = []   # nose / face / none / missing
+all_kpts = []         # per-frame skeleton: (17,3)
+all_state = []        # "LOCKED", "CARRY", "MISSING", "AMBIGUOUS"
+all_idx = []          # person index from YOLO, -1 if not determined
 
-# ----------------------------------------------------------
-# 7) 追跡用パラメータ
-# ----------------------------------------------------------
-# CONF_MIN:
-#   これより信頼度が低い点は「無いもの」と扱って NaN にする
-CONF_MIN = 0.3
+all_head_xy = []      # per-frame head coordinate (2,)
+all_head_source = []  # "nose", "face", "none", etc.
 
-# （今回は未使用. 連続性を厳密にするなら使う）
-MAX_JUMP_PX = 120
+last_valid_row_k = None
+last_valid_head_xy = None
+last_valid_head_src = None
 
-# ----------------------------------------------------------
-# 8) メインループ（1フレームずつ処理）
-# ----------------------------------------------------------
-frame_idx = 0
 while True:
     ret, frame = cap.read()
     if not ret:
-        break  # 動画が終わったら終了
+        break
 
-    # ------------------------------------------
-    # 8-1) YOLO Pose で検出
-    # ------------------------------------------
-    # res には:
-    # ・boxes（人の四角い枠）
-    # ・keypoints（骨格17点）
-    # が入る
-    res = pose_model.predict(frame, verbose=False, conf=CONF_MIN)[0]
+    boxes, kpts_all = yolo_pose(frame)
 
-    # 人の枠（使えない時もあるので保険付き）
-    boxes = (
-        res.boxes.xyxy.cpu().numpy()
-        if res.boxes is not None else np.zeros((0,4))
-    )
-
-    # 骨格点:
-    # shape は (人数, 17, 3)
-    # 3 は (x, y, confidence)
-    kpts = (
-        res.keypoints.data.cpu().numpy()
-        if res.keypoints is not None else np.zeros((0,17,3))
-    )
-
-    # ------------------------------------------
-    # 8-2) 人が1人も検出されない場合
-    # ------------------------------------------
-    if kpts.shape[0] == 0:
-        # 初回は NaN を入れておく
-        # 2フレーム目以降は「直前データをそのまま入れる」設計
-        all_kpts.append(
-            all_kpts[-1] if frame_idx > 0 else np.full((17,3), np.nan)
+    # Case A: no persons detected.
+    if kpts_all.shape[0] == 0:
+        row_k, head_xy, head_src, st = missing_result(
+            last_valid_row_k,
+            last_valid_head_xy,
+            last_valid_head_src,
+            carry=True
         )
-        all_state.append("MISSING")
+        all_state.append(st)
         all_idx.append(-1)
-        all_head_xy.append(np.array([np.nan, np.nan]))
-        all_head_source.append("missing")
-        frame_idx += 1
-        continue
 
-    # ------------------------------------------
-    # 8-3) 「ベッド内にいる人」だけを候補にする
-    # ------------------------------------------
-    candidates = []
+    else:
+        # Filter persons inside the bed gate.
+        candidates = make_candidates(boxes, kpts_all)
 
-    # 検出された人数分だけループ
-    for i in range(kpts.shape[0]):
-        kp_xy = kpts[i, :, :2].copy()  # (17,2) 座標
-        kp_c  = kpts[i, :, 2]          # (17,) 信頼度
-
-        # 信頼度が低い点は NaN にする（後で無視できる）
-        kp_xy[kp_c < CONF_MIN] = np.nan
-
-        # 骨格から中心を推定
-        center = center_from_kpts(kp_xy)
-
-        # 骨格が全滅で中心が作れなければ, box中心で代用
-        if center is None:
-            x1, y1, x2, y2 = boxes[i]
-            center = np.array([(x1+x2)/2, (y1+y2)/2])
-
-        # ベッド内なら候補に追加
-        if inside_gate(center[0], center[1]):
-            candidates.append(
-                dict(i=i, center=center, kp_xy=kp_xy, kp_c=kp_c)
+        # Case B: nobody is inside the gate.
+        if len(candidates) == 0:
+            row_k, head_xy, head_src, st = missing_result(
+                last_valid_row_k,
+                last_valid_head_xy,
+                last_valid_head_src,
+                carry=True
             )
+            all_state.append(st)
+            all_idx.append(-1)
 
-    # 候補が誰もいなければ MISSING 扱い
-    if not candidates:
-        all_kpts.append(all_kpts[-1])
-        all_state.append("MISSING")
-        all_idx.append(-1)
-        all_head_xy.append(np.array([np.nan, np.nan]))
-        all_head_source.append("missing")
-        frame_idx += 1
-        continue
+        else:
+            # Case C: ambiguous, more than one candidate inside the gate.
+            if len(candidates) != 1:
+                row_k, head_xy, head_src, st = missing_result(
+                    last_valid_row_k,
+                    last_valid_head_xy,
+                    last_valid_head_src,
+                    carry=True
+                )
+                all_state.append("AMBIGUOUS")
+                all_idx.append(-1)
 
-    # ------------------------------------------
-    # 8-4) 候補の中から「ベッド中心に一番近い人」を選ぶ
-    # ------------------------------------------
-    # これが person1（患者役）になる
-    chosen = min(
-        candidates,
-        key=lambda c: np.hypot(
-            c["center"][0] - bed_cx,
-            c["center"][1] - bed_cy
-        )
-    )
+            # Case D: exactly one candidate, lock as person1.
+            else:
+                chosen = candidates[0]
+                row_k, head_xy, head_src = pack_result(chosen)
 
-    # 追跡状態を LOCKED にする
-    state = "LOCKED"
-    person1_idx = chosen["i"]
-    prev_center = chosen["center"]
+                all_state.append("LOCKED")
+                all_idx.append(chosen["i"])
 
-    # ------------------------------------------
-    # 8-5) 保存用の形に整形して記録
-    # ------------------------------------------
-    # chosen["kp_xy"] は (17,2)
-    # chosen["kp_c"]  は (17,)
-    #
-    # 保存したいのは (17,3) つまり (x,y,conf)
-    row_k = np.stack(
-        [chosen["kp_xy"][:, 0], chosen["kp_xy"][:, 1], chosen["kp_c"]],
-        axis=1
-    )
+                # Face mosaic first (privacy), then draw skeleton for QC.
+                bbox = face_bbox_from_kpts(
+                    chosen["kp_xy"], chosen["kp_c"],
+                    W, H,
+                    conf_thr=FACE_CONF_THR,
+                    margin_x=0.6,
+                    margin_y=0.9
+                )
+                if bbox is not None:
+                    x1, y1, x2, y2 = bbox
+                    frame = apply_mosaic(frame, x1, y1, x2, y2, block=FACE_MOSAIC_BLOCK)
 
-    # 頭の代表点も計算して保存する
-    head_xy, head_src = compute_head_point(
-        chosen["kp_xy"],
-        chosen["kp_c"],
-        CONF_MIN
-    )
+                draw_skeleton(frame, chosen["kp_xy"])
 
-    # 各リストに追加（フレームごと）
+                # Update last valid result for carry-forward.
+                last_valid_row_k = row_k
+                last_valid_head_xy = head_xy
+                last_valid_head_src = head_src
+
+    # Save outputs for this frame.
     all_kpts.append(row_k)
-    all_state.append(state)
-    all_idx.append(person1_idx)
     all_head_xy.append(head_xy)
     all_head_source.append(head_src)
 
-    # ------------------------------------------
-    # 8-6) 確認用に骨格を描いて動画に保存
-    # ------------------------------------------
-    draw_skeleton(frame, chosen["kp_xy"])
     out.write(frame)
 
-    frame_idx += 1
-
-# ----------------------------------------------------------
-# 9) 終了処理（動画を閉じる）
-# ----------------------------------------------------------
 cap.release()
 out.release()
 
-# ----------------------------------------------------------
-# 10) NPZ 保存のために numpy配列に変換
-# ----------------------------------------------------------
-kpts_raw  = np.array(all_kpts)          # shape: (フレーム数, 17, 3)
-state_arr = np.array(all_state)         # shape: (フレーム数,)
-time_all  = np.arange(len(kpts_raw)) / fps  # 各フレームの時刻（秒）
 
 # ----------------------------------------------------------
-# 11) NPZ（numpy形式の保存ファイル）に書き出す
+# 7. Save results to NPZ
 # ----------------------------------------------------------
+kpts_raw = np.array(all_kpts)          # (N_frames, 17, 3)
+time_all = np.arange(len(kpts_raw)) / float(fps)
+
 np.savez(
     npz_out,
     kpts_raw=kpts_raw,
@@ -394,22 +493,26 @@ np.savez(
     head_source=np.array(all_head_source),
     fps=float(fps),
     time_all=time_all,
-    state=state_arr,
+    state=np.array(all_state),
     person1_idx=np.array(all_idx),
 )
 
-print("[OK] NPZ saved:", npz_out)
+print(f"[OK] NPZ saved: {npz_out}")
+
 
 # ----------------------------------------------------------
-# 12) QuickTime で再生できるように ffmpeg で再エンコード
+# 8. Re-encode for macOS QuickTime compatibility
+#
+# OpenCV-written MP4 can be problematic on QuickTime (seeking, playback).
+# Re-encoding with ffmpeg (H.264, yuv420p, baseline) improves compatibility.
 # ----------------------------------------------------------
-# OpenCVで書いた mp4 は, MacのQuickTimeで再生できないことがある.
-# そのため ffmpeg で「互換性が高い形式」に変換する.
 os.system(
     f"ffmpeg -y -i {out_try_path} "
-    f"-vcodec libx264 -pix_fmt yuv420p "
+    f"-vcodec libx264 "
+    f"-pix_fmt yuv420p "
     f"-profile:v baseline -level 3.0 "
-    f"-movflags +faststart {out_qt_path}"
+    f"-movflags +faststart "
+    f"{out_qt_path}"
 )
 
-print("[OK] QT video:", out_qt_path)
+print(f"[OK] QuickTime-friendly video saved: {out_qt_path}")
