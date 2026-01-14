@@ -1,143 +1,167 @@
 # ==========================================================
-# mp4動画を「○秒から○秒まで」切り出すコード
+# Trim an MP4 video using time (in seconds)
 #
-# ポイント:
-# ・動画は「秒」ではなく「フレーム番号」で扱われる
-# ・そのため「秒 → フレーム番号」に変換して処理している
-# ・元の動画は消さず, 新しい動画ファイルを作る
+# This cell:
+#   - extracts a video segment from START_SEC to END_SEC
+#   - keeps the original video unchanged
+#   - saves the trimmed segment as a new MP4 file
+#
+# This is useful when you want to analyze only a specific
+# seizure segment from a long VEEG recording.
 # ==========================================================
 
-import cv2, os   # 動画処理(cv2)とファイル操作(os)を使う
+import cv2
+import os
 
 # ----------------------------------------------------------
-# ① ここだけ変更すればOKな設定
+# User settings
 # ----------------------------------------------------------
-
-# 元の動画ファイル
-SRC_MP4 = '/content/FBTCS.mp4'
-
-# 切り出した動画の保存先
-OUT_MP4 = '/content/FBTCS_qt.mp4'
-
-# 切り出し開始時間（秒）
-START_SEC = 13
-
-# 切り出し終了時間（秒）
-END_SEC = 28     # None にすると最後まで
+# SRC_MP4   : path to the input video file
+# OUT_MP4   : path to the output (trimmed) video file
+# START_SEC : start time in seconds
+# END_SEC   : end time in seconds
+#             set to None to extract until the end of the video
+SRC_MP4   = "/content/FBTCS.mp4"
+OUT_MP4   = "/content/FBTCS_qt.mp4"
+START_SEC = 19     # start at 19 seconds
+END_SEC   = 34     # end at 34 seconds (None = until EOF)
 
 # ----------------------------------------------------------
-# ② 元の動画ファイルが存在するか確認
+# Check that the input video exists
 # ----------------------------------------------------------
 if not os.path.exists(SRC_MP4):
-    # ファイルが無い場合はここで止める
-    raise FileNotFoundError("動画ファイルが見つかりません")
+    raise FileNotFoundError(f"Input video not found: {SRC_MP4}")
 
-# ----------------------------------------------------------
-# ③ 動画ファイルを開く
-# ----------------------------------------------------------
+# Open the video using OpenCV
 cap = cv2.VideoCapture(SRC_MP4)
-
 if not cap.isOpened():
-    # 動画が開けない場合はエラー
-    raise RuntimeError("動画を開けませんでした")
+    raise RuntimeError("Failed to open video with VideoCapture")
 
 # ----------------------------------------------------------
-# ④ 動画の基本情報を取得
+# Read basic video properties
 # ----------------------------------------------------------
-
-# fps = 1秒あたり何フレームあるか
 fps = cap.get(cv2.CAP_PROP_FPS)
 
-# 動画の横と縦の大きさ（ピクセル）
+# Total number of frames (may be unavailable for some codecs)
+frame_count_raw = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+frame_count = frame_count_raw if frame_count_raw > 0 else None
+
+# Frame size
 width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+# Safety check
 if width <= 0 or height <= 0:
     cap.release()
-    raise RuntimeError("動画サイズを取得できません")
+    raise RuntimeError(
+        "Failed to read video size (corrupted video or unsupported codec)"
+    )
 
-print(f"fps = {fps}")
-print(f"size = {width} x {height}")
+print(
+    f"[INFO] fps={fps:.3f}, "
+    f"frames={frame_count if frame_count is not None else 'unknown'}, "
+    f"size={width}x{height}"
+)
 
 # ----------------------------------------------------------
-# ⑤ 「秒」を「フレーム番号」に変換
+# Convert time (seconds) to frame indices
 # ----------------------------------------------------------
-# 動画はフレーム番号で扱うため,
-# 秒 × fps = フレーム番号 になる
-
+# Example:
+#   15.0 seconds × 30 fps = frame 450
+#
+# round() is used to select the nearest frame.
 start_frame = int(round(START_SEC * fps))
-end_frame   = int(round(END_SEC * fps)) if END_SEC is not None else None
+end_frame   = None if END_SEC is None else int(round(END_SEC * fps))
 
-# マイナスにならないように保険
-start_frame = max(0, start_frame)
-if end_frame is not None:
-    end_frame = max(0, end_frame)
-
-print(f"切り出し: frame {start_frame} 〜 {end_frame}")
+# Log trimming range
+if end_frame is None:
+    print(
+        f"[INFO] trim frames: {start_frame} .. EOF "
+        f"({start_frame / fps:.3f} sec ..)"
+    )
+else:
+    print(
+        f"[INFO] trim frames: {start_frame} .. {end_frame - 1} "
+        f"({start_frame / fps:.3f}–{(end_frame - 1) / fps:.3f} sec)"
+    )
 
 # ----------------------------------------------------------
-# ⑥ 出力用の動画ファイルを準備
+# Seek to the starting frame
 # ----------------------------------------------------------
-# いきなり完成ファイルを書かず,
-# 一時ファイルに書いてから置き換える（安全のため）
+# Note:
+# cap.set() may silently fail for some video formats,
+# so we always check the actual frame position.
+ok = cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+print(
+    f"[INFO] seek requested={start_frame}, "
+    f"actual_pos={pos}, ok={ok}"
+)
 
-tmp_mp4 = OUT_MP4 + '.__tmp__.mp4'
+# ----------------------------------------------------------
+# Prepare a temporary output file
+# ----------------------------------------------------------
+tmp_mp4 = OUT_MP4 + ".__tmp__.mp4"
 
+# Remove existing temporary file if present
 if os.path.exists(tmp_mp4):
     os.remove(tmp_mp4)
 
-# mp4用の一般的な形式
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+# Use a common MP4 codec
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-# 書き込み用オブジェクトを作成
+# Create the video writer
 out = cv2.VideoWriter(tmp_mp4, fourcc, fps, (width, height))
-
 if not out.isOpened():
     cap.release()
-    raise RuntimeError("出力動画を作れませんでした")
+    raise RuntimeError(f"Failed to open VideoWriter: {tmp_mp4}")
 
 # ----------------------------------------------------------
-# ⑦ 開始フレームまで移動
+# Read and write frames one by one
 # ----------------------------------------------------------
-# 指定したフレーム番号まで移動する
-cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-# ----------------------------------------------------------
-# ⑧ フレームを1枚ずつコピーする
-# ----------------------------------------------------------
-current_frame = start_frame
 written = 0
 
+# Maximum number of frames to write (if END_SEC is specified)
+if end_frame is None:
+    max_to_write = None
+else:
+    max_to_write = max(0, end_frame - start_frame)
+
 while True:
-    # 終了フレームに到達したら止める
-    if end_frame is not None and current_frame >= end_frame:
+    # Stop if we reached the desired length
+    if max_to_write is not None and written >= max_to_write:
         break
 
-    # フレームを1枚読む
     ret, frame = cap.read()
-
     if not ret:
-        # 読めなければ動画の終わり
+        print(
+            "[WARNING] Failed to read frame "
+            "(end of video or seek failure)"
+        )
         break
 
-    # フレームを書き込む
     out.write(frame)
-
     written += 1
-    current_frame += 1
 
-# ----------------------------------------------------------
-# ⑨ 後片付け
-# ----------------------------------------------------------
 cap.release()
 out.release()
 
-if written == 0:
+# ----------------------------------------------------------
+# Check that at least one frame was written
+# ----------------------------------------------------------
+if written <= 0:
     if os.path.exists(tmp_mp4):
         os.remove(tmp_mp4)
-    raise RuntimeError("フレームを書き出せませんでした")
+    raise RuntimeError(
+        "No frames were written. "
+        "Please check the input video and time range."
+    )
 
-# 一時ファイルを正式な出力ファイルに変更
+# ----------------------------------------------------------
+# Replace the output file atomically
+# ----------------------------------------------------------
+# os.replace is safer than os.rename if something goes wrong
 os.replace(tmp_mp4, OUT_MP4)
 
-print("動画の切り出しが完了しました")
+print(f"[OK] Trimmed video saved: {OUT_MP4}")
+print(f"[OK] Original video kept unchanged: {SRC_MP4}")
