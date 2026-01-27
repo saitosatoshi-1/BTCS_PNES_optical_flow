@@ -1,100 +1,72 @@
 """
-pc1_panels_dynamic_minimal.py
+pc1_dynamic_metrics_core.py
 
-目的.
-  flow_pc1.csv の pc1_dyn だけを使って,
-  0–10秒の区間で次の3指標だけを計算して保存する.
+Purpose
+-------
+Compute three dynamic-PC1 metrics from flow_pc1.csv using only pc1_dyn:
+  1) PC1 area (AUC of |PC1|), 0–10 s
+  2) ADS (Amplitude Decay Slope): slope of ln(|PC1|) vs time, 0–10 s
+  3) Kendall tau: monotonic trend of inter-peak interval T vs time, 0–10 s
 
-  1) PC1 area.
-     |PC1| の時間積分(AUC), 0–10 s.
+Input
+-----
+flow_pc1.csv with required columns:
+  - t_sec
+  - pc1_dyn
 
-  2) ADS, Amplitude Decay Slope.
-     |PC1| を指数関数で近似するために, ln(|PC1|) を time に対して回帰し,
-     その傾き(slope)をADSとする, 0–10 s.
-     slope < 0 なら減衰.
-
-  3) Kendall tau.
-     ピーク間隔 T が時間とともに単調に増えるかを見る指標.
-     time midpoints(tm) と T の Kendall tau を計算する, 0–10 s.
-
-入力.
-  - flow_pc1.csv, 必須列.
-      t_sec, pc1_dyn
-
-出力.
-  - flow_dyn_minimal.png, QC用図(2パネル)
-  - flow_summary_dyn_minimal.csv, 特徴量1行
+Output
+------
+flow_summary_dyn_core.csv (single-row table)
 """
 
 from __future__ import annotations
 
-import os
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
 from scipy.ndimage import uniform_filter1d
 from scipy.stats import linregress, kendalltau
-from matplotlib import rcParams
 
 
-# ==========================================================
-# 1) Style
-# ==========================================================
-rcParams["font.family"] = "DejaVu Sans"
-rcParams["font.size"] = 10
-
-
-# ==========================================================
-# 2) I, O
-# ==========================================================
+# =========================
+# Parameters
+# =========================
 IN_CSV = "flow_pc1.csv"
-OUT_DIR = "."
-os.makedirs(OUT_DIR, exist_ok=True)
+OUT_CSV = "flow_summary_dyn_core.csv"
 
-OUT_PNG = os.path.join(OUT_DIR, "flow_dyn_minimal.png")
-OUT_SUMMARY = os.path.join(OUT_DIR, "flow_summary_dyn_minimal.csv")
-
-
-# ==========================================================
-# 3) Parameters
-# ==========================================================
 PC1_COL = "pc1_dyn"
 
-WINDOW_SEC = 10.0
-SMOOTH_SEC = 0.20
+WINDOW_SEC = 10.0          # analyze 0–10 s after the first valid sample
+SMOOTH_SEC = 0.20          # smoothing for |PC1| and peak detection stability
 
-PEAK_MIN_FRAC = 0.20
-PEAK_MIN_ABS = 0.0
-MIN_DIST_SEC = 0.2
+# Peak detection thresholds (positive peaks only).
+PEAK_MIN_FRAC = 0.20       # fraction of a robust amplitude reference (95th percentile)
+PEAK_MIN_ABS = 0.0         # absolute threshold (use >0 only if you need hard gating)
+MIN_DIST_SEC = 0.2         # merge peaks closer than this
 
 
-# ==========================================================
-# 4) Helper functions
-# ==========================================================
 def ensure_odd(n: int) -> int:
-    """移動平均の窓を奇数にして, 中心揃えになりやすくする."""
+    """
+    Ensure an integer is odd.
+    An odd window size makes the moving window symmetric around the center sample.
+    """
     return int(n) | 1
-
-
-def estimate_fps_from_time(t: np.ndarray) -> float:
-    """時刻列からfpsを推定する, 微小なズレに強い."""
-    dt = np.diff(t)
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    if dt.size == 0:
-        return 30.0
-    return float(1.0 / np.median(dt))
 
 
 def smooth_ma_nan(x: np.ndarray, fs: float, sec: float) -> np.ndarray:
     """
-    NaNに強い移動平均.
-    - NaNを0として足し合わせ, 有効サンプル数で割る.
+    NaN-tolerant moving average.
+
+    Idea.
+      - Replace NaNs with 0 for the numerator.
+      - Count valid samples for the denominator.
+      - Divide numerator by denominator, keep NaN where denominator is 0.
+
+    This avoids interpolating across missing data.
     """
-    x = np.asarray(x, float)
+    x = np.asarray(x, dtype=float)
 
     if sec <= 0:
-        return x
+        return x.copy()
 
     k = ensure_odd(max(1, int(round(fs * sec))))
 
@@ -105,77 +77,135 @@ def smooth_ma_nan(x: np.ndarray, fs: float, sec: float) -> np.ndarray:
     num = uniform_filter1d(x2, size=k, mode="nearest")
     den = uniform_filter1d(valid, size=k, mode="nearest")
 
-    y = num / np.maximum(den, 1e-9)
-    y[den < 1e-9] = np.nan
+    y = num / np.maximum(den, 1e-12)
+    y[den < 1e-12] = np.nan
     return y
 
 
-def exp_decay_regression(time_sec: np.ndarray, y: np.ndarray) -> dict:
+def rolling_p95_positive(pc1_s: np.ndarray, fs: float, win_sec: float) -> np.ndarray:
     """
-    ln(y) = intercept + slope*time の回帰でADSを推定する.
-    yは正が必要なので, logの前に下限を入れる.
+    Compute a rolling 95th percentile of the positive PC1 amplitude.
+
+    Method requirement.
+      - Apply a 2.0-s moving window to the positive amplitude of PC1.
+      - Compute the 95th percentile within that window.
+      - Use it as a local amplitude reference for peak-thresholding.
+
+    Implementation.
+      - Use a centered window of length win_sec.
+      - Only positive values (pc1_s > 0) contribute.
+      - NaNs are ignored.
+      - If a window has too few valid points, output NaN for that index.
+
+    Notes.
+      - For a 10-s segment at ~30 fps, this loop is fast enough and keeps behavior explicit.
+      - If you later process very long recordings, we can optimize this.
     """
-    m = np.isfinite(time_sec) & np.isfinite(y)
-    t = time_sec[m]
-    v = y[m]
+    pc1_s = np.asarray(pc1_s, dtype=float)
 
-    if v.size < 5:
-        return {"slope": np.nan, "r": np.nan, "yhat": np.full_like(time_sec, np.nan)}
+    win_n = int(round(win_sec * fs))
+    win_n = max(3, ensure_odd(win_n))
+    half = win_n // 2
 
-    vv = np.maximum(v, 1e-9)
-    yy = np.log(vv)
+    # Keep only positive amplitude, everything else becomes NaN.
+    pos = pc1_s.copy()
+    pos[~np.isfinite(pos)] = np.nan
+    pos[pos <= 0] = np.nan
 
-    slope, intercept, r, _, _ = linregress(t, yy)
-    yhat = np.exp(intercept + slope * time_sec)
+    p95 = np.full(pos.shape, np.nan, dtype=float)
 
-    return {"slope": float(slope), "r": float(r), "yhat": yhat}
+    for i in range(pos.size):
+        s = max(0, i - half)
+        e = min(pos.size, i + half + 1)
+
+        seg = pos[s:e]
+        seg = seg[np.isfinite(seg)]
+        if seg.size < 5:
+            continue
+
+        p95[i] = float(np.percentile(seg, 95))
+
+    return p95
 
 
-def detect_cycles(pc1: np.ndarray, time_sec: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def detect_cycles_positive_peaks(
+    pc1: np.ndarray,
+    time_sec: np.ndarray,
+    fs: float,
+    smooth_sec: float = 0.20,
+    p95_win_sec: float = 2.0,
+    peak_min_frac: float = 0.20,
+    peak_min_abs: float = 0.0,
+    min_dist_sec: float = 0.2,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    正側ピークを使って周期(ピーク間隔)を作る.
+    Detect positive peaks and derive inter-peak intervals, aligned to your Methods.
 
-    手順.
-      1) 平滑化したPC1でゼロクロッシングを探す.
-      2) 上向きゼロクロッシングから次の下向きゼロクロッシングまでを1周期窓とみなし,
-         その窓の最大をピークとする.
-      3) 小さすぎるピークを捨てる.
-      4) 近すぎるピークは統合する.
+    Steps.
+      1) Smooth PC1 with a 0.2-s moving average.
+      2) Define each cycle window as:
+           upward zero crossing (y = 0) -> subsequent downward zero crossing.
+      3) Within each cycle window, take the maximum value as the peak.
+      4) Suppress over-detection using a local threshold:
+           local_ref(t) = rolling 95th percentile of positive PC1 amplitude
+                          in a 2.0-s moving window.
+           keep peak only if:
+             peak >= max(peak_min_abs, peak_min_frac * local_ref(at peak time)).
+      5) Merge peaks that are closer than 0.2 s by keeping the larger one.
 
-    戻り値.
-      pc1_s, t_peaks, tm, T
-      tmはピーク間の中点時刻, Tはピーク間隔(秒).
+    Returns.
+      pc1_s  : smoothed PC1
+      t_peaks: peak times
+      tm     : midpoints between successive peaks
+      T      : inter-peak intervals (seconds)
     """
-    pc1_s = smooth_ma_nan(pc1, fs, SMOOTH_SEC)
+    pc1 = np.asarray(pc1, dtype=float)
+    time_sec = np.asarray(time_sec, dtype=float)
 
-    pos = pc1_s[np.isfinite(pc1_s) & (pc1_s > 0)]
-    if pos.size >= 10:
-        ref = float(np.nanpercentile(pos, 95))
-        peak_thr = max(float(PEAK_MIN_ABS), float(PEAK_MIN_FRAC) * ref)
-    else:
-        peak_thr = float(PEAK_MIN_ABS)
+    # 1) Smooth PC1 for stable zero-crossing and cycle segmentation.
+    pc1_s = smooth_ma_nan(pc1, fs, smooth_sec)
 
+    # 2) Compute the local 95th percentile reference (2.0-s moving window).
+    local_p95 = rolling_p95_positive(pc1_s, fs, win_sec=p95_win_sec)
+
+    # 3) Zero-crossings on the smoothed waveform.
     up = np.where((pc1_s[:-1] <= 0) & (pc1_s[1:] > 0))[0]
     dn = np.where((pc1_s[:-1] > 0) & (pc1_s[1:] <= 0))[0]
 
-    t_raw = []
-    a_raw = []
+    t_raw: list[float] = []
+    a_raw: list[float] = []
 
+    # 4) For each upward crossing, find the next downward crossing, then pick the max.
     for iu in up:
         dn_after = dn[dn > iu]
         if dn_after.size == 0:
             continue
 
-        seg = pc1_s[iu:dn_after[0] + 1]
+        end = int(dn_after[0])
+        seg = pc1_s[iu:end + 1]
+
         if seg.size == 0 or np.all(~np.isfinite(seg)):
             continue
 
         im = int(np.nanargmax(seg))
+        ipk = int(iu + im)
+
         a_peak = float(seg[im])
-        if (not np.isfinite(a_peak)) or (a_peak < peak_thr):
+        if not np.isfinite(a_peak):
             continue
 
-        t_raw.append(float(time_sec[iu + im]))
+        # Local threshold at the peak index.
+        ref = float(local_p95[ipk]) if np.isfinite(local_p95[ipk]) else np.nan
+        thr = float(peak_min_abs)
+
+        if np.isfinite(ref) and ref > 0:
+            thr = max(thr, float(peak_min_frac) * ref)
+
+        # Reject minor peaks below the local threshold.
+        if a_peak < thr:
+            continue
+
+        t_raw.append(float(time_sec[ipk]))
         a_raw.append(a_peak)
 
     if len(t_raw) < 2:
@@ -184,17 +214,18 @@ def detect_cycles(pc1: np.ndarray, time_sec: np.ndarray, fs: float) -> tuple[np.
     t_raw = np.asarray(t_raw, float)
     a_raw = np.asarray(a_raw, float)
 
-    t_keep = [t_raw[0]]
-    a_keep = [a_raw[0]]
+    # 5) Merge peaks closer than min_dist_sec by keeping the largest amplitude.
+    t_keep = [float(t_raw[0])]
+    a_keep = [float(a_raw[0])]
 
     for t, a in zip(t_raw[1:], a_raw[1:]):
-        if t - t_keep[-1] < float(MIN_DIST_SEC):
-            if a > a_keep[-1]:
-                t_keep[-1] = t
-                a_keep[-1] = a
+        if float(t) - float(t_keep[-1]) < float(min_dist_sec):
+            if float(a) > float(a_keep[-1]):
+                t_keep[-1] = float(t)
+                a_keep[-1] = float(a)
         else:
-            t_keep.append(t)
-            a_keep.append(a)
+            t_keep.append(float(t))
+            a_keep.append(float(a))
 
     t_peaks = np.asarray(t_keep, float)
     if t_peaks.size < 2:
@@ -207,36 +238,28 @@ def detect_cycles(pc1: np.ndarray, time_sec: np.ndarray, fs: float) -> tuple[np.
     return pc1_s, t_peaks, tm[ok], T[ok]
 
 
-def safe_auc(y: np.ndarray, t: np.ndarray) -> float:
-    """有効点が2点以上あるときだけAUCを計算する."""
-    m = np.isfinite(y) & np.isfinite(t)
-    if int(m.sum()) < 2:
-        return float("nan")
-    return float(np.trapz(y[m], t[m]))
-
-
-# ==========================================================
-# 5) Load, cut to 0–10 s
-# ==========================================================
+# =========================
+# Main
+# =========================
 df = pd.read_csv(IN_CSV)
 
-if "t_sec" not in df.columns:
-    raise KeyError("t_sec column is required.")
-
-if PC1_COL not in df.columns:
-    raise KeyError(f"{PC1_COL} column is required.")
+required = {"t_sec", PC1_COL}
+missing = [c for c in required if c not in df.columns]
+if len(missing) > 0:
+    raise KeyError(f"Missing columns in {IN_CSV}. Required={sorted(list(required))}, missing={missing}.")
 
 t_all = df["t_sec"].to_numpy(float)
 pc1_all = df[PC1_COL].to_numpy(float)
 
-m_valid = np.isfinite(t_all) & np.isfinite(pc1_all)
-t_all = t_all[m_valid]
-pc1_all = pc1_all[m_valid]
+# Keep only finite pairs.
+m = np.isfinite(t_all) & np.isfinite(pc1_all)
+t_all = t_all[m]
+pc1_all = pc1_all[m]
 
 if t_all.size < 10:
     raise RuntimeError("Too few valid samples in input CSV.")
 
-# timeを0開始にして, 0–10秒を切り出す
+# Define the analysis window as 0–10 s from the first valid time point.
 t0 = float(t_all[0])
 time = t_all - t0
 
@@ -245,99 +268,42 @@ time = time[m_win]
 pc1 = pc1_all[m_win]
 
 if time.size < 10:
-    raise RuntimeError("Too few samples in 0–10 s window. Check the input CSV.")
+    raise RuntimeError("Too few samples in the 0–10 s window.")
 
-fs = estimate_fps_from_time(time)
+fs = estimate_fs_from_time(time)
 
-
-# ==========================================================
-# 6) Metrics, PC1 area, ADS, Kendall tau
-# ==========================================================
+# --- Metric 1: PC1 area (AUC of |PC1|) ---
 amp = smooth_ma_nan(np.abs(pc1), fs, SMOOTH_SEC)
-
 pc1_area_0_10 = safe_auc(amp, time)
 
+# --- Metric 2: ADS (slope of ln(|PC1|) vs time) ---
 ads = exp_decay_regression(time, amp)
 ads_slope_0_10 = float(ads["slope"])
-ads_r2_0_10 = float(ads["r"] ** 2) if np.isfinite(ads["r"]) else np.nan
+ads_r2_0_10 = float(ads["r"] ** 2) if np.isfinite(ads["r"]) else float("nan")
 
-pc1_s, t_peaks, tm, T = detect_cycles(pc1, time, fs)
-
+# --- Metric 3: Kendall tau of inter-peak intervals ---
+_, t_peaks, tm, T = detect_cycles_positive_peaks(pc1, time, fs)
 if tm.size >= 5:
-    kendall_tau_0_10, kendall_p_0_10 = kendalltau(tm, T)
-    kendall_tau_0_10 = float(kendall_tau_0_10)
-    kendall_p_0_10 = float(kendall_p_0_10)
+    tau, p = kendalltau(tm, T)
+    kendall_tau_0_10 = float(tau)
+    kendall_p_0_10 = float(p)
 else:
-    kendall_tau_0_10, kendall_p_0_10 = np.nan, np.nan
+    kendall_tau_0_10 = float("nan")
+    kendall_p_0_10 = float("nan")
 
-
-# ==========================================================
-# 7) Plot, 2 panels, minimal QC
-# ==========================================================
-fig = plt.figure(figsize=(6, 7))
-gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.35)
-
-axA = fig.add_subplot(gs[0])
-axB = fig.add_subplot(gs[1], sharex=axA)
-
-# (A) PC1 waveform + peaks
-axA.plot(time, pc1_s, label="PC1 smoothed")
-if t_peaks.size > 0:
-    axA.scatter(t_peaks, np.interp(t_peaks, time, pc1_s), s=28, edgecolors="k", facecolors="C1")
-axA.set_ylabel("PC1 (a.u.)")
-axA.set_title("Dynamic PC1 waveform, 0–10 s")
-axA.grid(True, alpha=0.3)
-axA.text(
-    0.02, 0.05,
-    f"Peaks = {int(t_peaks.size)}\n"
-    f"Kendall τ = {kendall_tau_0_10:.2f}",
-    transform=axA.transAxes,
-    va="bottom",
-    bbox=dict(boxstyle="round", fc="white")
+# Save a single-row summary CSV.
+summary = pd.DataFrame(
+    [
+        {
+            "PC1_source": PC1_COL,
+            "window_sec": float(WINDOW_SEC),
+            "PC1_area_0_10": float(pc1_area_0_10),
+            "ADS_slope_0_10": float(ads_slope_0_10),
+            "ADS_R2_0_10": float(ads_r2_0_10),
+            "Kendall_tau_0_10": float(kendall_tau_0_10),
+            "Kendall_p_0_10": float(kendall_p_0_10),
+            "Peak_n": int(t_peaks.size),
+        }
+    ]
 )
-
-# (B) |PC1| and ADS fit
-axB.plot(time, amp, label="|PC1| smoothed")
-axB.plot(time, ads["yhat"], "k--", label="ADS fit")
-axB.set_ylabel("|PC1| (a.u.)")
-axB.set_xlabel("Time (s)")
-axB.set_title("Amplitude, 0–10 s")
-axB.grid(True, alpha=0.3)
-axB.legend()
-axB.text(
-    0.02, 0.95,
-    f"PC1 area = {pc1_area_0_10:.2f}\n"
-    f"ADS slope = {ads_slope_0_10:.3f}\n"
-    f"ADS R2 = {ads_r2_0_10:.2f}",
-    transform=axB.transAxes,
-    va="top",
-    bbox=dict(boxstyle="round", fc="white")
-)
-
-fig.tight_layout()
-fig.savefig(OUT_PNG, dpi=150, bbox_inches="tight")
-plt.show()
-
-
-# ==========================================================
-# 8) Save summary CSV, one row
-# ==========================================================
-summary = {
-    "PC1_source": PC1_COL,
-    "window_sec": float(WINDOW_SEC),
-
-    "PC1_area_0_10": float(pc1_area_0_10),
-
-    "ADS_slope_0_10": float(ads_slope_0_10),
-    "ADS_R2_0_10": float(ads_r2_0_10),
-
-    "Kendall_tau_0_10": float(kendall_tau_0_10),
-    "Kendall_p_0_10": float(kendall_p_0_10),
-
-    "Peak_n": int(t_peaks.size),
-}
-
-pd.DataFrame([summary]).to_csv(OUT_SUMMARY, index=False)
-
-print("Saved figure:", OUT_PNG)
-print("Saved summary CSV:", OUT_SUMMARY)
+summary.to_csv(OUT_CSV, index=False)
