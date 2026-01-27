@@ -13,9 +13,6 @@ Specifically, for each frame:
   3) The projected flow components are spatially averaged within an ROI polygon.
   4) Frame-wise features are saved to a CSV file.
 
-This script intentionally excludes any visualization or QC video generation
-to expose only the analytical core used for quantitative analysis.
-
 Inputs
 ------
 - video_path : str
@@ -36,15 +33,6 @@ Outputs
 - out_csv : str
     CSV file with per-frame motion features:
         frame, t_sec, skel_idx, axes_ok, vx_body, vy_body, mag_body
-
-Notes
------
-- Optical flow requires a previous frame; therefore, the first frame always
-  yields NaN values.
-- If body-axis vectors ex or ey are invalid (NaN), output values are set to NaN.
-- Synchronization between video time and upstream arrays is performed using
-  a no-look-ahead rule:
-      max idx such that time_all[idx] <= t_sec.
 """
 
 from __future__ import annotations
