@@ -55,12 +55,6 @@ def ensure_odd(n: int) -> int:
 def smooth_ma_nan(x: np.ndarray, fs: float, sec: float) -> np.ndarray:
     """
     NaN-tolerant moving average.
-
-    Idea.
-      - Replace NaNs with 0 for the numerator.
-      - Count valid samples for the denominator.
-      - Divide numerator by denominator, keep NaN where denominator is 0.
-
     This avoids interpolating across missing data.
     """
     x = np.asarray(x, dtype=float)
@@ -96,10 +90,6 @@ def rolling_p95_positive(pc1_s: np.ndarray, fs: float, win_sec: float) -> np.nda
       - Only positive values (pc1_s > 0) contribute.
       - NaNs are ignored.
       - If a window has too few valid points, output NaN for that index.
-
-    Notes.
-      - For a 10-s segment at ~30 fps, this loop is fast enough and keeps behavior explicit.
-      - If you later process very long recordings, we can optimize this.
     """
     pc1_s = np.asarray(pc1_s, dtype=float)
 
