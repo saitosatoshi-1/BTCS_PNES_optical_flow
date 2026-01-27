@@ -1,7 +1,7 @@
-# Quantitative Analysis of Upper Limb Clonic Movements Using Optical Flow
+# Quantitative Analysis of Upper Limb Rhythmic Clonic Movements Using Optical Flow
 
 ## Overview
-This repository provides Python code for quantitative analysis of upper-limb clonic movements
+This repository provides Python code for quantitative analysis of upper-limb rhythmic clonic movements
 in bilateral tonic–clonic seizures (BTCS) and psychogenic nonepileptic seizures (PNES)
 using optical flow analysis and principal component analysis (PCA).
 
@@ -15,29 +15,20 @@ video-EEG monitoring (VEEG) recordings and corresponds to the analyses reported 
 
 ## Key Concepts
 - Dense optical flow (Farnebäck method) for motion quantification
-- Body-centered coordinate projection using shoulder landmarks
 - PCA-based dimensionality reduction of two-dimensional motion
 - Quantification of temporal changes in clonic frequency and amplitude
 
 ---
 
 ## Analysis Pipeline
-1. **Manual ROI selection**  
-   A trapezoidal region of interest (ROI) covering one upper limb is manually defined
-   and fixed throughout the analysis window.
-
-2. **Optical flow estimation**  
+1. **Optical flow estimation**  
    Dense optical flow vectors are computed within the ROI using the Farnebäck method.
 
-3. **Body-axis projection**  
-   Optical flow vectors are projected onto a body-centered coordinate system
-   defined by shoulder landmarks.
-
-4. **Principal component analysis (PCA)**  
+2. **Principal component analysis (PCA)**  
    Short-time PCA is applied to velocity vectors to extract the dominant movement
    direction as a one-dimensional waveform (PC1).
 
-5. **Metric extraction**  
+3. **Metric extraction**  
    Frequency- and amplitude-related metrics are computed from the PC1 waveform.
 
 ---
