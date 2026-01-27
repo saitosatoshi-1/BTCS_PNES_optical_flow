@@ -44,10 +44,6 @@ import cv2
 
 # ==========================================================
 # Farnebäck optical flow parameters
-#
-# These parameters control the spatial and temporal sensitivity
-# of dense optical flow estimation.
-# In practice, winsize is the parameter most often adjusted.
 # ==========================================================
 FB_PARAMS = dict(
     pyr_scale=0.5,     # Image pyramid scaling factor
@@ -66,13 +62,6 @@ FB_PARAMS = dict(
 def open_video(video_path: str, fallback_fps: float) -> tuple[cv2.VideoCapture, float, int, int]:
     """
     Open a video file and extract basic metadata.
-
-    Parameters
-    ----------
-    video_path : str
-        Path to the input video.
-    fallback_fps : float
-        Frame rate used if the video file does not provide a valid FPS.
 
     Returns
     -------
@@ -121,7 +110,6 @@ def build_roi_mask(H: int, W: int, roi_polygon_xy: np.ndarray) -> np.ndarray:
 def frame_time_sec(cap: cv2.VideoCapture, frame_idx: int, fps: float) -> float:
     """
     Obtain the time stamp of the current frame in seconds.
-
     Priority is given to CAP_PROP_POS_MSEC.
     If unavailable, time is estimated from frame index and FPS.
     """
@@ -134,11 +122,9 @@ def frame_time_sec(cap: cv2.VideoCapture, frame_idx: int, fps: float) -> float:
 def skel_index_from_time(t_sec: float, time_all: np.ndarray) -> int:
     """
     Map a video time stamp to the corresponding upstream index.
-
     The selected index satisfies:
         time_all[idx] <= t_sec
     and is the largest such index (no look-ahead).
-
     This ensures temporal causality between video frames
     and body-axis estimates.
     """
