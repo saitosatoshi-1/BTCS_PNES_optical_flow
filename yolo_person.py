@@ -31,7 +31,7 @@ from ultralytics import YOLO
 # ----------------------------------------------------------
 # 2. Paths and constants
 # ----------------------------------------------------------
-video_path   = "/content/FBTCS_qt.mp4"
+video_path   = "/content/BTCS_qt.mp4"
 out_try_path = "/content/track.mp4"
 out_qt_path  = "/content/track_qt.mp4"
 npz_out      = "/content/track.npz"
