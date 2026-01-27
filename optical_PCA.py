@@ -25,13 +25,6 @@ Given v(t) = [vx(t), vy(t)]:
    where e1(t) is assigned to each time sample by the nearest window center.
    (This is a non-centered projection, consistent with the manuscript statement.)
 
-Notes
------
-- PCA axis has sign ambiguity (w and -w). We align axes to a fixed reference
-  direction (+y) and to the previous window to reduce sign flips.
-- If a window has too few valid samples, it is skipped.
-- Samples not covered by any valid window remain NaN.
-
 Input
 -----
 flow.csv with columns: t_sec, vx_body, vy_body
