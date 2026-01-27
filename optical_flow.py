@@ -1,349 +1,314 @@
 """
-pca_dynamic_pc1_beginner.py
+body_axis_flow_core.py
 
-Goal.
-  flow.csv の vx_body, vy_body から, dynamic PC1(pc1_dyn) を作る.
+Purpose
+-------
+This script computes dense optical flow between consecutive video frames and
+quantifies motion along predefined body axes within a fixed region of interest (ROI).
 
-Background.
-  - vx_body, vy_body は body座標系の ROI平均 optical flow.
-  - 2次元(vx, vy) を 1次元に要約したい.
-  - PCAの第1主成分方向 e1(t) を sliding window で推定し,
-    pc1_dyn(t) = v(t) · e1(t) (non-centered projection) を出力する.
+Specifically, for each frame:
+  1) Dense optical flow is computed using the Farnebäck method.
+  2) The 2D flow vectors (fx, fy) are projected onto body-axis unit vectors
+     ex and ey, which are estimated upstream.
+  3) The projected flow components are spatially averaged within an ROI polygon.
+  4) Frame-wise features are saved to a CSV file.
 
-Input.
-  flow.csv with columns:
-    - t_sec
-    - vx_body
-    - vy_body
+This script intentionally excludes any visualization or QC video generation
+to expose only the analytical core used for quantitative analysis.
 
-Output.
-  - flow_pc1.csv: t_sec, vx_body_bpf, vy_body_bpf, pc1_dyn, e1_dyn_x, e1_dyn_y
-  - flow_pc1_dyn.png: QC plot (vx,vy and pc1_dyn)
+Inputs
+------
+- video_path : str
+    Path to the input video file.
+- inter_npz : str
+    Path to an upstream NPZ file containing:
+        - time_all : array (T,)
+            Time stamps corresponding to body-axis estimates.
+        - fps : float
+            Frame rate used in upstream processing.
+        - ex, ey : arrays (T, 2)
+            Unit vectors defining the body coordinate system.
+- roi_polygon_xy : ndarray (N, 2)
+    Polygon defining the ROI in image coordinates.
 
-Notes.
-  - Band-pass filtering is applied to suppress drift and high-frequency noise.
-  - NaNs are handled without interpolation, filtering is applied only to valid contiguous runs.
+Outputs
+-------
+- out_csv : str
+    CSV file with per-frame motion features:
+        frame, t_sec, skel_idx, axes_ok, vx_body, vy_body, mag_body
+
+Notes
+-----
+- Optical flow requires a previous frame; therefore, the first frame always
+  yields NaN values.
+- If body-axis vectors ex or ey are invalid (NaN), output values are set to NaN.
+- Synchronization between video time and upstream arrays is performed using
+  a no-look-ahead rule:
+      max idx such that time_all[idx] <= t_sec.
 """
 
 from __future__ import annotations
 
-import os
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
-from matplotlib import rcParams
-from scipy.signal import butter, sosfiltfilt
+import cv2
 
 
 # ==========================================================
-# Style.
+# Farnebäck optical flow parameters
+#
+# These parameters control the spatial and temporal sensitivity
+# of dense optical flow estimation.
+# In practice, winsize is the parameter most often adjusted.
 # ==========================================================
-rcParams["font.family"] = "DejaVu Sans"
-rcParams["font.size"] = 10
-
-
-# ==========================================================
-# I/O.
-# ==========================================================
-FLOW_CSV = "flow.csv"
-OUT_DIR = "."
-os.makedirs(OUT_DIR, exist_ok=True)
-
-OUT_CSV = os.path.join(OUT_DIR, "flow_pc1.csv")
-OUT_PNG = os.path.join(OUT_DIR, "flow_pc1_dyn.png")
-
-
-# ==========================================================
-# Parameters.
-# ==========================================================
-BPF_LOW_HZ = 0.5
-BPF_HIGH_HZ = 5.0
-BPF_ORDER = 4
-
-MIN_SAMPLES_PCA = 3
-
-WIN_SEC = 2.0
-STEP_SEC = 0.1
-AXIS_SMOOTH_SEC = 0.3
-
-PROJECT_CENTERED = False  # recommended, False
-
-
-# ==========================================================
-# Small helper functions.
-# ==========================================================
-def butter_bandpass_sos(low_hz: float, high_hz: float, fs: float, order: int = 4) -> np.ndarray:
-    """Create a Butterworth band-pass filter in SOS form."""
-    nyq = 0.5 * fs
-    if not (0 < low_hz < high_hz < nyq):
-        raise ValueError(f"Invalid band-pass range. low={low_hz}, high={high_hz}, nyquist={nyq}.")
-    return butter(order, [low_hz / nyq, high_hz / nyq], btype="band", output="sos")
-
-
-def sos_required_padlen(sos: np.ndarray) -> int:
-    """
-    Estimate minimum length for stable sosfiltfilt padding.
-    This is a conservative heuristic.
-    """
-    nsec = int(sos.shape[0])
-    ntaps = 2 * nsec + 1
-    return 3 * (ntaps - 1)
-
-
-def finite_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    """Return contiguous runs of True as [(start, end), ...] (inclusive)."""
-    idx = np.flatnonzero(mask)
-    if idx.size == 0:
-        return []
-    gap = np.where(np.diff(idx) > 1)[0]
-    s = np.r_[idx[0], idx[gap + 1]]
-    e = np.r_[idx[gap], idx[-1]]
-    return [(int(a), int(b)) for a, b in zip(s, e)]
-
-
-def bandpass_nanrobust(x: np.ndarray, sos: np.ndarray) -> np.ndarray:
-    """
-    Band-pass filter that does not interpolate across NaNs.
-    Only long-enough contiguous finite segments are filtered.
-    """
-    x = np.asarray(x, dtype=float)
-    y = np.full_like(x, np.nan)
-
-    m = np.isfinite(x)
-    minlen = sos_required_padlen(sos) + 1
-
-    for s, e in finite_runs(m):
-        seg = x[s:e + 1]
-        if seg.size < minlen:
-            continue
-
-        pad = min(sos_required_padlen(sos), int(seg.size // 2 - 1))
-        if pad <= 0:
-            y[s:e + 1] = seg
-        else:
-            y[s:e + 1] = sosfiltfilt(sos, seg, padlen=pad)
-
-    return y
-
-
-def align_axis_to_ref(w: np.ndarray, ref: np.ndarray = np.array([0.0, 1.0])) -> np.ndarray:
-    """
-    PCA axis has sign ambiguity, w and -w are equivalent.
-    Align w so that dot(w, ref) >= 0.
-    """
-    if np.any(~np.isfinite(w)):
-        return w
-    return -w if float(np.dot(w, ref)) < 0 else w
-
-
-def moving_average_nan(x: np.ndarray, win: int) -> np.ndarray:
-    """NaN-tolerant moving average, simple and beginner-friendly."""
-    x = np.asarray(x, dtype=float)
-    if win <= 1:
-        return x.copy()
-
-    y = np.full_like(x, np.nan)
-    half = int(win // 2)
-
-    for i in range(x.size):
-        s = max(0, i - half)
-        e = min(x.size, i + half + 1)
-        seg = x[s:e]
-        if np.isfinite(seg).sum() == 0:
-            continue
-        y[i] = float(np.nanmean(seg))
-
-    return y
-
-
-def dynamic_pc1_sliding(
-    time_sec: np.ndarray,
-    vx: np.ndarray,
-    vy: np.ndarray,
-    win_sec: float,
-    step_sec: float,
-    axis_smooth_sec: float = 0.0,
-    ref: np.ndarray = np.array([0.0, 1.0]),
-    project_centered: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Sliding-window PCA to obtain a time-varying axis e1(t) and dynamic PC1.
-
-    Returns.
-      pc1_dyn, e1_x, e1_y
-    """
-    time_sec = np.asarray(time_sec, dtype=float)
-    vx = np.asarray(vx, dtype=float)
-    vy = np.asarray(vy, dtype=float)
-
-    n = int(time_sec.size)
-    pc1_dyn = np.full(n, np.nan)
-    e1_x = np.full(n, np.nan)
-    e1_y = np.full(n, np.nan)
-
-    if n < MIN_SAMPLES_PCA:
-        return pc1_dyn, e1_x, e1_y
-
-    dt = np.diff(time_sec)
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    fs = float(1.0 / np.median(dt)) if dt.size else 30.0
-
-    win_n = max(3, int(round(win_sec * fs)))
-    step_n = max(1, int(round(step_sec * fs)))
-
-    centers = []
-    W_list = []
-    MU_list = []
-
-    prev_w = None
-
-    for start in range(0, n - win_n + 1, step_n):
-        end = start + win_n
-
-        vx_seg = vx[start:end]
-        vy_seg = vy[start:end]
-        m = np.isfinite(vx_seg) & np.isfinite(vy_seg)
-
-        if int(m.sum()) < MIN_SAMPLES_PCA:
-            continue
-
-        X = np.column_stack([vx_seg[m], vy_seg[m]])
-        mu = X.mean(axis=0)
-        Xc = X - mu
-
-        C = np.cov(Xc, rowvar=False)
-        vals, V = np.linalg.eigh(C)
-        w = V[:, int(np.argmax(vals))]
-
-        w = align_axis_to_ref(w, ref=ref)
-
-        if prev_w is not None and float(np.dot(w, prev_w)) < 0:
-            w = -w
-        prev_w = w.copy()
-
-        c = int((start + end - 1) // 2)
-        centers.append(c)
-        W_list.append(w)
-        MU_list.append(mu)
-
-    if len(centers) == 0:
-        return pc1_dyn, e1_x, e1_y
-
-    centers = np.asarray(centers, dtype=int)
-    W = np.vstack(W_list)
-    MU = np.vstack(MU_list)
-
-    # Assign the nearest window axis to each sample.
-    idx_near = np.searchsorted(centers, np.arange(n), side="left")
-    idx_near = np.clip(idx_near, 0, len(centers) - 1)
-
-    pick = np.zeros(n, dtype=int)
-    for i in range(n):
-        j = int(idx_near[i])
-        j2 = max(0, j - 1)
-        pick[i] = j2 if abs(i - int(centers[j2])) < abs(i - int(centers[j])) else j
-
-    e1_x = W[pick, 0]
-    e1_y = W[pick, 1]
-
-    # Optional smoothing of axis angle.
-    if axis_smooth_sec and axis_smooth_sec > 0:
-        ang = np.arctan2(e1_y, e1_x)
-        ang_u = np.unwrap(ang)
-
-        win_ang = max(1, int(round(axis_smooth_sec * fs)))
-        ang_u_sm = moving_average_nan(ang_u, win_ang)
-
-        e1_x = np.cos(ang_u_sm)
-        e1_y = np.sin(ang_u_sm)
-
-        flip = np.isfinite(e1_y) & (e1_y < 0)
-        e1_x[flip] *= -1
-        e1_y[flip] *= -1
-
-    # Projection.
-    m_all = np.isfinite(vx) & np.isfinite(vy) & np.isfinite(e1_x) & np.isfinite(e1_y)
-
-    if project_centered:
-        mu_t = MU[pick]
-        pc1_dyn[m_all] = (vx[m_all] - mu_t[m_all, 0]) * e1_x[m_all] + (vy[m_all] - mu_t[m_all, 1]) * e1_y[m_all]
-    else:
-        pc1_dyn[m_all] = vx[m_all] * e1_x[m_all] + vy[m_all] * e1_y[m_all]
-
-    return pc1_dyn, e1_x, e1_y
-
-
-def clean_axes(ax) -> None:
-    """Simple publication-style axes."""
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.grid(True, alpha=0.25)
-
-
-# ==========================================================
-# Main.
-# ==========================================================
-df = pd.read_csv(FLOW_CSV)
-
-need_cols = {"t_sec", "vx_body", "vy_body"}
-missing = [c for c in need_cols if c not in df.columns]
-if len(missing) > 0:
-    raise KeyError(f"Missing columns in {FLOW_CSV}. Required: {sorted(list(need_cols))}. Missing: {missing}.")
-
-time_all = df["t_sec"].to_numpy(float)
-vx_raw = df["vx_body"].to_numpy(float)
-vy_raw = df["vy_body"].to_numpy(float)
-
-dt = np.diff(time_all)
-dt = dt[np.isfinite(dt) & (dt > 0)]
-fps = float(1.0 / np.median(dt)) if dt.size else 30.0
-
-sos = butter_bandpass_sos(BPF_LOW_HZ, BPF_HIGH_HZ, fps, order=BPF_ORDER)
-vx_bpf = bandpass_nanrobust(vx_raw, sos)
-vy_bpf = bandpass_nanrobust(vy_raw, sos)
-
-pc1_dyn, e1x, e1y = dynamic_pc1_sliding(
-    time_sec=time_all,
-    vx=vx_bpf,
-    vy=vy_bpf,
-    win_sec=WIN_SEC,
-    step_sec=STEP_SEC,
-    axis_smooth_sec=AXIS_SMOOTH_SEC,
-    ref=np.array([0.0, 1.0]),
-    project_centered=PROJECT_CENTERED,
+FB_PARAMS = dict(
+    pyr_scale=0.5,     # Image pyramid scaling factor
+    levels=3,          # Number of pyramid levels
+    winsize=15,        # Averaging window size (pixels)
+    iterations=3,      # Iterations per pyramid level
+    poly_n=5,          # Size of the pixel neighborhood
+    poly_sigma=1.2,    # Standard deviation of the Gaussian
+    flags=0
 )
 
-# Save CSV.
-out = pd.DataFrame(
-    {
-        "t_sec": time_all,
-        "vx_body_bpf": vx_bpf,
-        "vy_body_bpf": vy_bpf,
-        "pc1_dyn": pc1_dyn,
-        "e1_dyn_x": e1x,
-        "e1_dyn_y": e1y,
-    }
-)
-out.to_csv(OUT_CSV, index=False)
 
-# QC plot.
-fig, axs = plt.subplots(2, 1, figsize=(7, 6), dpi=200, sharex=True)
+# ==========================================================
+# Utility functions
+# ==========================================================
+def open_video(video_path: str, fallback_fps: float) -> tuple[cv2.VideoCapture, float, int, int]:
+    """
+    Open a video file and extract basic metadata.
 
-axs[0].plot(time_all, vx_bpf, label="vx_body (BPF)")
-axs[0].plot(time_all, vy_bpf, label="vy_body (BPF)")
-axs[0].set_title("Body-axis ROI flow, band-pass filtered")
-axs[0].set_ylabel("Flow (a.u.)")
-axs[0].legend()
-clean_axes(axs[0])
+    Parameters
+    ----------
+    video_path : str
+        Path to the input video.
+    fallback_fps : float
+        Frame rate used if the video file does not provide a valid FPS.
 
-axs[1].plot(time_all, pc1_dyn, label=f"pc1_dyn (WIN={WIN_SEC}s, STEP={STEP_SEC}s)")
-axs[1].set_title("Dynamic PC1 (sliding-window PCA)")
-axs[1].set_xlabel("Time (s)")
-axs[1].set_ylabel("PC1 (a.u.)")
-axs[1].legend()
-clean_axes(axs[1])
+    Returns
+    -------
+    cap : cv2.VideoCapture
+        OpenCV video capture object.
+    fps : float
+        Frames per second.
+    W, H : int
+        Frame width and height.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"VideoCapture failed: {video_path}")
 
-fig.tight_layout()
-fig.savefig(OUT_PNG, bbox_inches="tight")
-plt.show()
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps <= 0:
+        fps = float(fallback_fps)
+
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    return cap, float(fps), W, H
+
+
+def build_roi_mask(H: int, W: int, roi_polygon_xy: np.ndarray) -> np.ndarray:
+    """
+    Convert an ROI polygon into a boolean mask.
+
+    Parameters
+    ----------
+    H, W : int
+        Image height and width.
+    roi_polygon_xy : ndarray (N, 2)
+        Polygon vertices in image coordinates.
+
+    Returns
+    -------
+    mask : ndarray (H, W), bool
+        True for pixels inside the ROI.
+    """
+    poly = np.asarray(roi_polygon_xy, dtype=np.int32)
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(mask, [poly], 1)
+    return mask.astype(bool)
+
+
+def frame_time_sec(cap: cv2.VideoCapture, frame_idx: int, fps: float) -> float:
+    """
+    Obtain the time stamp of the current frame in seconds.
+
+    Priority is given to CAP_PROP_POS_MSEC.
+    If unavailable, time is estimated from frame index and FPS.
+    """
+    t_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+    if t_msec is not None and t_msec > 0:
+        return float(t_msec) / 1000.0
+    return float(frame_idx) / float(fps)
+
+
+def skel_index_from_time(t_sec: float, time_all: np.ndarray) -> int:
+    """
+    Map a video time stamp to the corresponding upstream index.
+
+    The selected index satisfies:
+        time_all[idx] <= t_sec
+    and is the largest such index (no look-ahead).
+
+    This ensures temporal causality between video frames
+    and body-axis estimates.
+    """
+    idx = int(np.searchsorted(time_all, t_sec, side="right") - 1)
+    idx = int(np.clip(idx, 0, len(time_all) - 1))
+    return idx
+
+
+def compute_roi_mean_body_flow(
+    prev_gray: np.ndarray,
+    gray: np.ndarray,
+    ex: np.ndarray,
+    ey: np.ndarray,
+    roi_mask: np.ndarray,
+    fb_params: dict
+) -> tuple[float, float, float]:
+    """
+    Compute ROI-averaged optical flow features in the body coordinate system.
+
+    Steps
+    -----
+    1) Compute dense optical flow between consecutive grayscale frames.
+    2) Project 2D flow vectors onto body-axis unit vectors ex and ey.
+    3) Compute spatial means of the projected flow components within the ROI.
+
+    Parameters
+    ----------
+    prev_gray, gray : ndarray (H, W)
+        Consecutive grayscale frames.
+    ex, ey : ndarray (2,)
+        Unit vectors defining the body coordinate system.
+    roi_mask : ndarray (H, W), bool
+        ROI mask.
+    fb_params : dict
+        Farnebäck optical flow parameters.
+
+    Returns
+    -------
+    vx_mean : float
+        Mean flow component along ex within the ROI.
+    vy_mean : float
+        Mean flow component along ey within the ROI.
+    mag_mean : float
+        Mean flow magnitude within the ROI.
+    """
+    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, **fb_params)
+
+    # Image-coordinate flow components
+    fx = flow[..., 0]
+    fy = flow[..., 1]
+
+    # Projection onto body axes
+    fx_body = fx * float(ex[0]) + fy * float(ex[1])
+    fy_body = fx * float(ey[0]) + fy * float(ey[1])
+
+    mag_body = cv2.magnitude(fx_body, fy_body)
+
+    vx_mean = float(np.nanmean(fx_body[roi_mask]))
+    vy_mean = float(np.nanmean(fy_body[roi_mask]))
+    mag_mean = float(np.nanmean(mag_body[roi_mask]))
+
+    return vx_mean, vy_mean, mag_mean
+
+
+# ==========================================================
+# Main processing function
+# ==========================================================
+def run_body_axis_flow_core(
+    video_path: str,
+    inter_npz: str,
+    roi_polygon_xy: np.ndarray,
+    out_csv: str,
+) -> None:
+    """
+    Run body-axis optical flow analysis and save results to CSV.
+    """
+    # --- Load upstream data ---
+    dat = np.load(inter_npz, allow_pickle=True)
+
+    time_all = np.asarray(dat["time_all"], dtype=float)
+    fps_npz = float(dat["fps"])
+    ex_all = np.asarray(dat["ex"], dtype=float)
+    ey_all = np.asarray(dat["ey"], dtype=float)
+
+    # --- Open video ---
+    cap, fps_vid, W, H = open_video(video_path, fallback_fps=fps_npz)
+
+    # --- Build ROI mask ---
+    roi_mask = build_roi_mask(H, W, roi_polygon_xy)
+
+    rows = []
+    prev_gray = None
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        t_sec = frame_time_sec(cap, frame_idx, fps_vid)
+        skel_idx = skel_index_from_time(t_sec, time_all)
+
+        ex = ex_all[skel_idx]
+        ey = ey_all[skel_idx]
+        axes_ok = bool(np.isfinite(ex).all() and np.isfinite(ey).all())
+
+        vx = np.nan
+        vy = np.nan
+        mag = np.nan
+
+        # Optical flow is computed only when body axes are valid
+        # and a previous frame is available.
+        if axes_ok and (prev_gray is not None):
+            vx, vy, mag = compute_roi_mean_body_flow(
+                prev_gray, gray, ex, ey, roi_mask, FB_PARAMS
+            )
+
+        rows.append([frame_idx, t_sec, skel_idx, int(axes_ok), vx, vy, mag])
+
+        prev_gray = gray
+        frame_idx += 1
+
+    cap.release()
+
+    # --- Save CSV ---
+    df = pd.DataFrame(
+        rows,
+        columns=["frame", "t_sec", "skel_idx", "axes_ok", "vx_body", "vy_body", "mag_body"]
+    )
+    df.to_csv(out_csv, index=False)
+
+
+# ==========================================================
+# Example usage
+# ==========================================================
+if __name__ == "__main__":
+    video_path = "input.mp4"
+    inter_npz = "skeleton_pc1.npz"
+
+    roi_polygon_xy = np.array(
+        [
+            [100, 100],
+            [500, 120],
+            [520, 380],
+            [120, 400],
+        ],
+        dtype=float
+    )
+
+    out_csv = "flow.csv"
+
+    run_body_axis_flow_core(
+        video_path=video_path,
+        inter_npz=inter_npz,
+        roi_polygon_xy=roi_polygon_xy,
+        out_csv=out_csv,
+    )
+
+    print("Saved:", out_csv)
