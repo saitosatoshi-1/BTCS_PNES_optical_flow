@@ -93,7 +93,7 @@ def build_roi_mask(H: int, W: int, roi_polygon_xy: np.ndarray) -> np.ndarray:
     ----------
     H, W : int
         Image height and width.
-    roi_polygon_xy : ndarray (N, 2)
+    roi_polygon_xy : ndarray (4, 2)
         Polygon vertices in image coordinates.
 
     Returns
