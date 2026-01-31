@@ -47,6 +47,7 @@ from scipy.signal import butter, sosfiltfilt
 FLOW_CSV = "flow.csv"
 OUT_CSV = "flow_pc1.csv"
 
+fs = 30
 BPF_LOW_HZ = 0.5
 BPF_HIGH_HZ = 5.0
 BPF_ORDER = 4
