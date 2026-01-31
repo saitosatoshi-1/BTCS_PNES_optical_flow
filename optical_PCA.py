@@ -60,18 +60,6 @@ MIN_SAMPLES_PCA = 3
 # =========================
 # Utilities: time and filtering
 # =========================
-def estimate_fs_from_time(time_sec: np.ndarray, default_fs: float = 30.0) -> float:
-    """
-    Estimate sampling rate from time stamps using the median positive dt.
-    This is robust to minor jitter in time_sec.
-    """
-    dt = np.diff(time_sec)
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    if dt.size == 0:
-        return float(default_fs)
-    return float(1.0 / np.median(dt))
-
-
 def butter_bandpass_sos(low_hz: float, high_hz: float, fs: float, order: int = 4) -> np.ndarray:
     """
     Create a Butterworth band-pass filter in SOS form (numerically stable).
@@ -182,8 +170,6 @@ def dynamic_pc1_sliding(
     if n < MIN_SAMPLES_PCA:
         return pc1_dyn
 
-    fs = estimate_fs_from_time(time_sec)
-
     win_n = max(MIN_SAMPLES_PCA, int(round(win_sec * fs)))
     step_n = max(1, int(round(step_sec * fs)))
 
@@ -263,8 +249,6 @@ def main() -> None:
     vx = df["vx_body"].to_numpy(float)
     vy = df["vy_body"].to_numpy(float)
 
-    # Sampling rate estimated from the time column.
-    fs = estimate_fs_from_time(t)
 
     # Band-pass filtering (NaN-safe, no interpolation).
     sos = butter_bandpass_sos(BPF_LOW_HZ, BPF_HIGH_HZ, fs, order=BPF_ORDER)
